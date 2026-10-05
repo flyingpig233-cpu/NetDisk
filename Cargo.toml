@@ -4,16 +4,26 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 chrono = { version = "0.4.45", features = ["serde"] }
+zip = "8.6.0"
 
-diesel = { version = "2.3.*", features = ["sqlite"] }
+diesel = { version = "2.3.*", features = ["sqlite", "r2d2"] }
+dotenv = "0.15"
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
+argon2 = { version = "0.6.0" }
+blake3 = "1.8.7"
+dirs = "7.0.0"
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+outdir-tempdir = "0.3.0"
+
 
 tracing-appender = "0.2"
 
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7.1", features = ["trace"] }

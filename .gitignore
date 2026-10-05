@@ -1,1 +1,21 @@
 /target
+
+# Local configuration and runtime data
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+/.VSCodeCounter/
+/migrations/.diesel_lock
+
+# Frontend dependencies and build output
+/frontend/node_modules/
+/frontend/dist/
