@@ -2019,3 +2019,13 @@ dialog::backdrop{
   .share-bottom>span{display:none}
   .share-code{font-size:32px}
 }
+
+
+.admin-workspace-banner { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; margin-bottom:24px; background:#e9f2ed; border:1px solid var(--border); border-radius:12px; color:var(--green); }
+.admin-user-list { padding:0 24px 16px; }
+.admin-user-row { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:20px 0; border-bottom:1px solid var(--border); }
+.admin-user-info { min-width:0; }
+.admin-user-info strong { display:block; overflow-wrap:anywhere; }
+.admin-user-info small { display:block; color:#677c6d; margin-top:8px; overflow-wrap:anywhere; }
+.admin-user-actions { display:flex; gap:8px; flex-shrink:0; }
+@media(max-width:760px) { .admin-user-row,.admin-workspace-banner { flex-wrap:wrap; } .admin-user-actions { flex-wrap:wrap; } .admin-user-list { padding:0 16px 16px; } }

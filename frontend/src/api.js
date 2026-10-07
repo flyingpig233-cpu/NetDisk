@@ -32,6 +32,10 @@ function pending(feature) { throw new Error(`${feature}接口尚未接入`); }
 export const api = {
   login: (username, password) => request('/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
   register: (username, password) => request('/register', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  adminUsers: () => request('/admin/users'),
+  deleteUser: id => request(`/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  adminUser: id => request(`/admin/users/${encodeURIComponent(id)}`),
+  updateUser: (id, data) => request(`/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
   user: () => request('/user_info'),
   list: (userId, parentId = ROOT_ID) => request(`/files?user_id=${encodeURIComponent(userId)}&parent_id=${encodeURIComponent(parentId || ROOT_ID)}`),
   metadata: id => request(`/files/${encodeURIComponent(id)}`),
@@ -39,10 +43,13 @@ export const api = {
   move: (id, newParentId = ROOT_ID) => request('/move', { method: 'POST', body: JSON.stringify({ file_id: id, new_parent_id: newParentId || ROOT_ID }) }),
   delete: id => request(`/files/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   createFolder: (name, owner, parent = ROOT_ID) => request('/files', { method: 'POST', body: JSON.stringify({ file_name: name, file_hash: '', file_size: 0, file_owner: owner, parent_id: parent, is_directory: true }) }),
-  upload(file, onProgress, parentId = '') {
+  upload(file, onProgress, parentId = '', userId = '') {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', `/api/upload${parentId ? `?parent_id=${encodeURIComponent(parentId)}` : ''}`);
+      const query = new URLSearchParams();
+      if (parentId) query.set('parent_id', parentId);
+      if (userId) query.set('user_id', userId);
+      xhr.open('POST', `/api/upload?${query}`);
       if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
       xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100)); };
       xhr.onload = () => {
