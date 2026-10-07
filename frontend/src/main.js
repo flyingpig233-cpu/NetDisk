@@ -2,6 +2,7 @@ import './style.css';
 import { api, ROOT_ID, setToken } from './api';
 import { icon } from './icons';
 import { demoFiles } from './demo';
+import { initShares, isShareRoute, renderSharePage, shareHistory, createShare, resetShareReceiver } from './shares';
 
 const app = document.querySelector('#app');
 const dialog = document.querySelector('#dialog');
@@ -29,7 +30,6 @@ function visibleFiles() {
   let files = state.files.filter(f => state.section === 'trash' ? f.trashed : !f.trashed);
   if (state.section === 'all' && (!state.query || !state.demo)) files = files.filter(f => f.parent_id === state.folder);
   else if (state.section === 'starred') files = files.filter(f => favorites.has(f.file_id));
-  else if (state.section === 'shared') files = [];
   else if (['image', 'doc', 'video', 'music', 'archive'].includes(state.section)) files = files.filter(f => kind(f) === state.section);
   else if (state.section === 'recent') files = files.filter(f => !f.is_directory);
   if (state.query) files = files.filter(f => f.file_name.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
@@ -61,15 +61,16 @@ function row(file) {
 }
 function fileGrid(files) { return `<div class="file-grid">${files.map(f => `<article class="file-tile ${state.selected.has(f.file_id) ? 'selected' : ''}"><div class="tile-top"><input type="checkbox" data-select="${escape(f.file_id)}" aria-label="选择 ${escape(f.file_name)}" ${state.selected.has(f.file_id) ? 'checked' : ''}><button class="icon-button" data-action="more" data-id="${escape(f.file_id)}" aria-label="更多操作">${icon('more')}</button></div><button class="tile-open" data-action="open" data-id="${escape(f.file_id)}"><span class="file-icon ${kind(f)}">${icon(kind(f))}</span><strong>${escape(f.file_name)}</strong><small>${f.is_directory ? `${state.files.filter(x => x.parent_id === f.file_id && !x.trashed).length} 个项目` : bytes(f.file_size)}</small></button></article>`).join('')}</div>`; }
 function emptyState() {
-  const message = state.query ? '没有找到匹配的文件' : state.section === 'shared' ? '还没有分享的文件' : state.section === 'trash' ? '回收站是空的' : state.section === 'starred' ? '把常用文件加上星标' : '这里还没有文件';
-  return `<div class="empty-state"><span>${icon(state.section === 'trash' ? 'trash' : state.section === 'starred' ? 'star' : 'folder')}</span><h3>${message}</h3><p>${state.query ? '试试其他关键词，或清空搜索。' : state.section === 'shared' ? '分享功能将在后续开放。' : state.section === 'trash' ? state.demo ? '移入回收站的文件会出现在这里。' : '回收站接口尚未开放。' : state.section === 'starred' ? '点击文件旁的星标，方便下次快速找到。' : '上传一份文件，开始整理你的空间。'}</p>${state.section === 'all' && !state.query ? actionButton('upload', '上传文件', 'upload', 'primary-button') : ''}</div>`;
+  const message = state.query ? '没有找到匹配的文件' : state.section === 'trash' ? '回收站是空的' : state.section === 'starred' ? '把常用文件加上星标' : '这里还没有文件';
+  return `<div class="empty-state"><span>${icon(state.section === 'trash' ? 'trash' : state.section === 'starred' ? 'star' : 'folder')}</span><h3>${message}</h3><p>${state.query ? '试试其他关键词，或清空搜索。' : state.section === 'trash' ? state.demo ? '移入回收站的文件会出现在这里。' : '回收站接口尚未开放。' : state.section === 'starred' ? '点击文件旁的星标，方便下次快速找到。' : '上传一份文件，开始整理你的空间。'}</p>${state.section === 'all' && !state.query ? actionButton('upload', '上传文件', 'upload', 'primary-button') : ''}</div>`;
 }
 function fileArea() {
+  if (state.section === 'shared') return shareHistory(state.query);
   const files = visibleFiles();
   const folder = fileById(state.folder);
   const title = state.query ? '搜索结果' : state.section === 'all' ? folder?.file_name || '全部文件' : sections[state.section];
   return `<section class="files-section"><div class="files-heading"><div class="heading-left"><h2>${escape(title)}</h2><span class="count">${files.length} 个项目</span></div><div class="file-tools"><label class="sort-control">${icon('sort')}<select id="sort" aria-label="文件排序"><option value="updated" ${state.sort === 'updated' ? 'selected' : ''}>最近修改</option><option value="name" ${state.sort === 'name' ? 'selected' : ''}>名称排序</option><option value="size" ${state.sort === 'size' ? 'selected' : ''}>文件大小</option></select></label><div class="view-toggle">${actionButton('list-view', '', 'list', `icon-button ${state.view === 'list' ? 'active' : ''}`, 'aria-label="列表视图"')}${actionButton('grid-view', '', 'grid', `icon-button ${state.view === 'grid' ? 'active' : ''}`, 'aria-label="网格视图"')}</div></div></div>
-    ${state.selected.size ? `<div class="selection-bar"><span>已选择 ${state.selected.size} 项</span>${state.section !== 'trash' && state.section !== 'shared' ? actionButton('move-selected', '移动', 'move', 'text-button') : ''}${actionButton('delete-selected', state.section === 'trash' ? '彻底删除' : state.demo ? '移入回收站' : '删除', 'trash', 'text-button')}${state.section === 'trash' ? actionButton('restore-selected', '恢复', 'clock', 'text-button') : ''}${actionButton('clear-selection', '取消选择', 'close', 'text-button')}</div>` : ''}
+    ${state.selected.size ? `<div class="selection-bar"><span>已选择 ${state.selected.size} 项</span>${state.section !== 'trash' && state.section !== 'shared' ? actionButton('share-selected', '分享', 'share', 'text-button') + actionButton('move-selected', '移动', 'move', 'text-button') : ''}${actionButton('delete-selected', state.section === 'trash' ? '彻底删除' : state.demo ? '移入回收站' : '删除', 'trash', 'text-button')}${state.section === 'trash' ? actionButton('restore-selected', '恢复', 'clock', 'text-button') : ''}${actionButton('clear-selection', '取消选择', 'close', 'text-button')}</div>` : ''}
     ${state.error ? `<div class="error-state">${icon('info')}<span>${escape(state.error)}</span>${actionButton('refresh', '重试', null, 'text-button')}</div>` : ''}
     ${state.busy ? '<div class="loading-state"><span class="spinner"></span>正在读取文件…</div>' : files.length ? state.view === 'grid' ? fileGrid(files) : `<div class="table-wrap"><table><thead><tr><th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择当前全部文件" ${files.every(f => state.selected.has(f.file_id)) ? 'checked' : ''}></th><th>文件名称</th><th class="type-cell">类型</th><th class="size-cell">大小</th><th class="date-cell">修改时间</th><th class="row-actions"></th></tr></thead><tbody>${files.map(row).join('')}</tbody></table></div>` : emptyState()}
     <div class="files-footer"><span>${state.demo ? '演示模式 · 操作仅在当前页面生效' : '个人文件空间'}</span><span>有序收藏，自在随行。</span></div></section>`;
@@ -79,11 +80,12 @@ function transfers() {
   return `<aside class="transfer-panel" aria-label="上传任务"><div class="transfer-heading"><strong>${icon('upload')}上传任务</strong><button class="icon-button" data-action="clear-transfers" aria-label="收起已完成的上传">${icon('close')}</button></div>${state.transfers.map(t => `<div class="transfer-item"><span class="file-icon doc">${icon('doc')}</span><div><strong>${escape(t.name)}</strong><small>${t.error ? escape(t.error) : t.done ? state.demo ? '已添加到演示空间' : '上传完成' : `正在上传 ${t.progress}%`}</small><div class="transfer-track"><i style="width:${t.progress}%"></i></div></div>${t.done ? icon('check', 'success-icon') : t.error ? icon('info') : ''}</div>`).join('')}</aside>`;
 }
 function render() {
+  if (isShareRoute()) { app.innerHTML = renderSharePage(); return; }
   const name = state.user?.username || '访客';
   document.title = `NetDisk · ${sections[state.section]}`;
   app.innerHTML = `${sidebar()}${state.mobile ? '<div class="sidebar-scrim" data-action="mobile-close"></div>' : ''}<div class="workspace"><header class="topbar"><button class="icon-button mobile-menu" data-action="mobile" aria-label="展开导航">${icon('menu')}</button><div class="breadcrumb"><span>个人空间</span>${icon('arrow')}<strong>${sections[state.section]}</strong></div><div class="top-actions"><button class="mode-pill" data-action="account"><span class="status-dot"></span>${state.demo ? '演示模式' : '已连接'}</button><button class="avatar" data-action="account" aria-label="账户：${escape(name)}">${escape(name.slice(0, 1).toUpperCase())}</button></div></header>
-    <main><div class="page-heading"><div><p class="eyebrow">YOUR PERSONAL SPACE</p><h1>${sections[state.section]}<span class="heading-dot">.</span></h1><p class="page-description">${state.section === 'all' ? '每一份文件，都有它的位置。' : state.section === 'recent' ? '接着上次的灵感，继续出发。' : state.section === 'starred' ? '重要的文件，一眼就能找到。' : state.section === 'trash' ? '留一点时间，重新做个决定。' : state.section === 'shared' ? '让好内容，遇见更多人。' : '将同一类收藏，放在一起。'}</p></div><div class="heading-actions">${actionButton('create-folder', '新建文件夹', 'plus', 'secondary-button')}${actionButton('upload', '上传文件', 'upload', 'primary-button')}</div></div>
-    <div class="search-row"><label class="search-box">${icon('search')}<input id="search" type="search" placeholder="搜索你的文件" aria-label="搜索文件" value="${escape(state.query)}"><kbd>/</kbd></label>${actionButton('refresh', '刷新', 'clock', 'refresh-button')}</div>
+    <main><div class="page-heading"><div><p class="eyebrow">YOUR PERSONAL SPACE</p><h1>${sections[state.section]}<span class="heading-dot">.</span></h1><p class="page-description">${state.section === 'all' ? '每一份文件，都有它的位置。' : state.section === 'recent' ? '接着上次的灵感，继续出发。' : state.section === 'starred' ? '重要的文件，一眼就能找到。' : state.section === 'trash' ? '留一点时间，重新做个决定。' : state.section === 'shared' ? '让好内容，遇见更多人。' : '将同一类收藏，放在一起。'}</p></div><div class="heading-actions">${state.section === 'shared' ? actionButton('extract-share', '提取分享', 'download', 'primary-button') : actionButton('create-folder', '新建文件夹', 'plus', 'secondary-button') + actionButton('upload', '上传文件', 'upload', 'primary-button')}</div></div>
+    <div class="search-row"><label class="search-box">${icon('search')}<input id="search" type="search" placeholder="${state.section === 'shared' ? '搜索分享码或文件名' : '搜索你的文件'}" aria-label="搜索" value="${escape(state.query)}"><kbd>/</kbd></label>${actionButton('refresh', '刷新', 'clock', 'refresh-button')}</div>
     ${state.folder !== ROOT_ID && state.section === 'all' ? `<div class="folder-breadcrumb"><button class="text-button" data-action="home">全部文件</button>${folderTrail()}</div>` : ''}
     ${recommendations()}${fileArea()}</main><footer class="workspace-footer"><span>NetDisk</span><small>属于你的，始终在这里。</small><span>简而有序</span></footer></div>${transfers()}`;
 }
@@ -98,7 +100,7 @@ function modal(title, content, onSubmit, submitLabel = '确认') {
   dialog.querySelector('#dialog-close').onclick = () => dialog.close();
   dialog.querySelector('#dialog-cancel').onclick = () => dialog.close();
   dialog.querySelector('form').onsubmit = async event => {
-    event.preventDefault(); const button = event.submitter; button.disabled = true;
+    event.preventDefault(); const button = event.submitter || event.target.querySelector('button[type="submit"]'); button.disabled = true;
     try { const close = await onSubmit(new FormData(event.target)); if (close !== false && dialog.open) dialog.close(); }
     catch (error) { dialog.querySelector('#form-error').textContent = error.message; }
     finally { button.disabled = false; }
@@ -112,6 +114,7 @@ function validName(value) {
   return name;
 }
 async function refresh() {
+  if (state.section === 'shared') { ++refreshId; state.busy = false; state.error = ''; render(); return; }
   if (state.demo) { render(); toast('文件列表已刷新'); return; }
   const requestId = ++refreshId;
   const userId = state.user.user_id; const folder = state.folder; const section = state.section;
@@ -155,6 +158,7 @@ function authDialog(register) {
     let user;
     try { user = await api.user(); } catch (error) { setToken(''); throw error; }
     state = { ...state, demo: false, user, files: [], section: 'all', folder: ROOT_ID, query: '', selected: new Set(), transfers: [], error: '' };
+    resetShareReceiver();
     await refresh(); toast('已连接个人空间');
   }, register ? '注册账户' : '登录');
   dialog.querySelector('.auth-switch').onclick = () => authDialog(!register);
@@ -293,7 +297,7 @@ function menu(file, button) {
   document.querySelector('.context-menu')?.remove();
   const menu = document.createElement('div'); menu.className = 'context-menu'; menu.setAttribute('role', 'group'); menu.setAttribute('aria-label', '文件操作');
   const data = `data-id="${escape(file.file_id)}"`;
-  menu.innerHTML = file.trashed ? `${actionButton('restore', '恢复文件', 'clock', '', data)}${actionButton('delete', '彻底删除', 'trash', 'danger', data)}` : `${actionButton('open', '打开', 'folder', '', data)}${!state.demo || !file.is_directory ? actionButton('download', file.is_directory ? '下载 ZIP' : '下载', 'download', '', data) : ''}${actionButton('rename', '重命名', 'edit', '', data)}${actionButton('move', '移动到', 'move', '', data)}${actionButton('star', favorites.has(file.file_id) ? '取消星标' : '添加星标', 'star', '', data)}${!file.is_directory ? actionButton('share', '分享', 'share', '', data) : ''}<hr>${actionButton('delete', state.demo ? '移入回收站' : '删除文件', 'trash', 'danger', data)}`;
+  menu.innerHTML = file.trashed ? `${actionButton('restore', '恢复文件', 'clock', '', data)}${actionButton('delete', '彻底删除', 'trash', 'danger', data)}` : `${actionButton('open', '打开', 'folder', '', data)}${!state.demo || !file.is_directory ? actionButton('download', file.is_directory ? '下载 ZIP' : '下载', 'download', '', data) : ''}${actionButton('rename', '重命名', 'edit', '', data)}${actionButton('move', '移动到', 'move', '', data)}${actionButton('star', favorites.has(file.file_id) ? '取消星标' : '添加星标', 'star', '', data)}${actionButton('share', '分享', 'share', '', data)}<hr>${actionButton('delete', state.demo ? '移入回收站' : '删除文件', 'trash', 'danger', data)}`;
   document.body.append(menu);
   const rect = button.getBoundingClientRect(); const height = menu.offsetHeight;
   menu.style.left = `${Math.max(8, Math.min(rect.right - 180, innerWidth - 190))}px`;
@@ -330,6 +334,7 @@ document.addEventListener('click', async event => {
     else if (action === 'home') { event.preventDefault(); state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); await refresh(); }
     else if (action === 'upload') input.click();
     else if (action === 'account') account();
+    else if (action === 'extract-share') location.hash = '/share';
     else if (action === 'refresh') await refresh();
     else if (action === 'open') await openFile(file);
     else if (action === 'create-folder') createFolder();
@@ -344,7 +349,8 @@ document.addEventListener('click', async event => {
     else if (action === 'clear-selection') { state.selected.clear(); render(); }
     else if (action === 'more' && file) menu(file, button);
     else if (action === 'download' && file) await download(file);
-    else if (action === 'share') await api.share(file?.file_id);
+    else if (action === 'share' && file) createShare([file]);
+    else if (action === 'share-selected') createShare([...state.selected].map(fileById).filter(Boolean));
     else if (action === 'list-view' || action === 'grid-view') { state.view = action === 'list-view' ? 'list' : 'grid'; try { localStorage.setItem('netdisk-view', JSON.stringify(state.view)); } catch { /* optional */ } render(); }
     else if (action === 'mobile' || action === 'mobile-close') { state.mobile = action === 'mobile'; render(); }
     else if (action === 'clear-transfers') { state.transfers = state.transfers.filter(t => !t.done && !t.error); render(); }
@@ -365,13 +371,18 @@ let dragDepth = 0;
 document.addEventListener('dragenter', event => { if ([...event.dataTransfer.types].includes('Files')) { event.preventDefault(); dragDepth++; document.body.classList.add('dragging'); } });
 document.addEventListener('dragover', event => { if ([...event.dataTransfer.types].includes('Files')) event.preventDefault(); });
 document.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
-document.addEventListener('drop', event => { if (![...event.dataTransfer.types].includes('Files')) return; event.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging'); if (!dialog.open) upload([...event.dataTransfer.files]); });
+document.addEventListener('drop', event => { if (![...event.dataTransfer.types].includes('Files')) return; event.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging'); if (!dialog.open && !isShareRoute()) upload([...event.dataTransfer.files]); });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') { document.querySelector('.context-menu')?.remove(); if (state.mobile) { state.mobile = false; render(); } }
   if (event.key === '/' && !dialog.open && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) { event.preventDefault(); document.querySelector('#search')?.focus(); }
 });
 window.addEventListener('resize', () => document.querySelector('.context-menu')?.remove());
 window.addEventListener('scroll', () => document.querySelector('.context-menu')?.remove(), true);
+initShares({
+  user: () => state.user, modal, toast, render,
+  login: () => authDialog(false), account,
+  home: () => { state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); void refresh(); },
+});
 render();
 if (sessionStorage.getItem('netdisk-token')) {
   state.busy = true; render();

@@ -57,8 +57,10 @@ export const api = {
     });
   },
   download: id => request(`/download/${encodeURIComponent(id)}`, {}, 'blob'),
+  share: (fileIds, expiredAt = null) => request('/create_share', { method: 'POST', body: JSON.stringify({ file_id_list: fileIds, expired_at: expiredAt }) }),
+  sharedFiles: code => request(`/shares/${encodeURIComponent(code)}`),
+  sharedDownload: (code, id) => request(`/shares/${encodeURIComponent(code)}/download/${encodeURIComponent(id)}`, {}, 'blob'),
   // TODO: implement these after adding the corresponding Rust routes.
-  share: async () => pending('分享'),
   trash: async () => pending('回收站'),
   restore: async () => pending('恢复文件'),
   quota: async () => pending('存储容量'),
