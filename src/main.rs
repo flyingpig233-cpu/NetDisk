@@ -4,6 +4,7 @@ mod db_types;
 mod file_system;
 mod schema;
 mod jwt;
+mod share;
 mod user;
 use file_system::file_manager::ensure_root;
 

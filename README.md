@@ -11,6 +11,22 @@ Rust + Axum 网盘后端，使用 Diesel 管理 SQLite 元数据，按 BLAKE3 �
 
 文件内容保存在用户主目录下的 `.netdisk_store` 中。`.env`、本地数据库及构建产物不提交到仓库。
 
+## 分享数据库与接口
+
+已有数据库执行 `diesel migration run` 升级。新增的 `share_table` 保存六位数字分享码、分享集合 ID（`dic_id`）以及 UTC 创建/过期时间；`share_files` 记录集合中的原文件 ID，不改变原文件的父目录。连接池启用 SQLite 外键，删除分享或源文件时会自动清理对应关联。
+
+登录后调用 `POST /create_share`，携带 `Authorization: Bearer <token>`：
+
+```json
+{"file_id_list":["文件或文件夹的 UUID"],"expired_at":null}
+```
+
+`expired_at` 为 Unix 时间戳（秒），必须在未来；省略或 `null` 表示永久有效。接口返回 HTTP 201 和 `{"share_code":"012345"}`，重复文件 ID 自动去重，只能分享自己的文件。文件夹分享关联文件夹本身，保留对其当前内容的引用。
+
+数据库层提供有效分享查询、关联文件查询、删除分享和清理过期记录。查询时判断有效期，创建分享时清理过期记录，并通过唯一约束和重试避免分享码冲突。
+
+接收者登录后可通过 `GET /shares/{share_code}` 获取文件列表，通过 `GET /shares/{share_code}/download/{file_id}` 下载分享中的文件或文件夹 ZIP；这两个接口都需要 JWT。未登录的公开提取/下载和分享密码尚未实现。
+
 ## 启动前端
 
 ```bash

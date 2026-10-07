@@ -15,6 +15,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use zip::ZipWriter;
 
+use crate::share::{ShareError, ShareManager};
 use crate::user::User;
 use crate::{
     db::DbPool,
@@ -42,6 +43,12 @@ pub fn router(state: AppState) -> Router {
             "/files/{file_id}",
             get(get_file).delete(delete_file).patch(rename_file),
         )
+        .route("/shares/{share_code}", get(get_share))
+        .route(
+            "/shares/{share_code}/download/{file_id}",
+            get(download_share),
+        )
+        .route("/create_share", post(create_share))
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/move", post(move_file))
         .route("/user_info", get(get_user_info))
@@ -95,6 +102,32 @@ impl From<diesel::result::Error> for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(value: std::io::Error) -> Self {
         ApiError::internal(value.to_string())
+    }
+}
+
+impl From<ShareError> for ApiError {
+    fn from(value: ShareError) -> Self {
+        let (status, message) = match value {
+            ShareError::EmptyFiles => (
+                StatusCode::BAD_REQUEST,
+                "Share must contain at least one file",
+            ),
+            ShareError::InvalidExpiration => (
+                StatusCode::BAD_REQUEST,
+                "Expiration must be a valid future Unix timestamp",
+            ),
+            ShareError::NotFound => (StatusCode::NOT_FOUND, "File not found"),
+            ShareError::Forbidden => (StatusCode::FORBIDDEN, "Cannot share another user's file"),
+            ShareError::CodeExhausted => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Could not allocate a share code; try again",
+            ),
+            ShareError::Database(error) => return error.into(),
+        };
+        Self {
+            status,
+            message: message.to_string(),
+        }
     }
 }
 
@@ -175,6 +208,17 @@ struct MoveFileRequest {
 }
 
 #[derive(Deserialize)]
+struct CreateShareRequest {
+    file_id_list: Vec<Uuid>,
+    expired_at: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct ShareResponse {
+    share_code: String,
+}
+
+#[derive(Deserialize)]
 struct UploadQuery {
     parent_id: Option<String>,
 }
@@ -204,6 +248,18 @@ async fn register_user(
         .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
     let user = UserManager::create_user(&mut conn, req.username, &req.password)?;
     Ok((StatusCode::CREATED, Json(user)))
+}
+
+async fn get_share(
+    State(state): State<AppState>,
+    Path(share_code): Path<String>,
+) -> Result<Json<Vec<FileMeta>>, ApiError> {
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
+    let file_list = ShareManager::get_files(&mut conn, &share_code)?;
+    Ok(Json(file_list))
 }
 
 async fn move_file(
@@ -350,6 +406,22 @@ async fn upload(
     Ok((StatusCode::CREATED, Json(meta)))
 }
 
+async fn download_share(
+    State(state): State<AppState>,
+    Path((share_code, file_id)): Path<(String, Uuid)>,
+) -> Result<Response, ApiError> {
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
+    let file_list = ShareManager::get_files(&mut conn, &share_code)?;
+    let target_file = file_list
+        .into_iter()
+        .find(|file| file.file_id == file_id)
+        .ok_or(ShareError::NotFound)?;
+    raw_download(State(state), target_file).await
+}
+
 async fn download(
     State(state): State<AppState>,
     Extension(claims): Extension<crate::jwt::Claims>,
@@ -365,7 +437,11 @@ async fn download(
             message: "Cannot download another user's file".to_string(),
         });
     }
+    raw_download(State(state), meta).await
+}
 
+async fn raw_download(State(state): State<AppState>, meta: FileMeta) -> Result<Response, ApiError> {
+    let mut fm = state.manager()?;
     if meta.is_directory {
         let dir = TempDir::new().autorm();
         let zip_list = fm.list_dict_recursive(meta.file_id, String::new())?;
@@ -411,6 +487,25 @@ async fn download(
         )
         .body(body)
         .unwrap())
+}
+
+async fn create_share(
+    State(state): State<AppState>,
+    Extension(claims): Extension<crate::jwt::Claims>,
+    Json(req): Json<CreateShareRequest>,
+) -> Result<(StatusCode, Json<ShareResponse>), ApiError> {
+    let owner = Uuid::from_str(&claims.sub).map_err(|_| ApiError::internal("Invalid user ID"))?;
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
+    let share = ShareManager::create_share(&mut conn, owner, req.file_id_list, req.expired_at)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ShareResponse {
+            share_code: share.share_code,
+        }),
+    ))
 }
 
 async fn get_file(

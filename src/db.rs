@@ -1,6 +1,6 @@
-use diesel::r2d2::{ConnectionManager, CustomizeConnection, Pool, PooledConnection};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
+use diesel::r2d2::{ConnectionManager, CustomizeConnection, Pool, PooledConnection};
 use std::time::Duration;
 
 pub type DbPool = Pool<ConnectionManager<SqliteConnection>>;
@@ -14,6 +14,8 @@ pub struct ConnectionOptions {
 
 impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for ConnectionOptions {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        conn.batch_execute("PRAGMA foreign_keys = ON;")
+            .map_err(diesel::r2d2::Error::QueryError)?;
         if let Some(d) = self.busy_timeout {
             conn.batch_execute(&format!("PRAGMA busy_timeout = {};", d.as_millis()))
                 .map_err(diesel::r2d2::Error::QueryError)?;
