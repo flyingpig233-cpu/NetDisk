@@ -5,9 +5,16 @@ use serde::{Deserialize, Serialize};
 pub fn secret_key() -> &'static str {
     static SECRET_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SECRET_KEY.get_or_init(|| {
-        let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-        assert!(secret.len() >= 32, "JWT_SECRET must be at least 32 bytes");
-        secret
+        #[cfg(test)]
+        {
+            "test-only-signing-secret-not-for-production".to_string()
+        }
+        #[cfg(not(test))]
+        {
+            let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+            assert!(secret.len() >= 32, "JWT_SECRET must be at least 32 bytes");
+            secret
+        }
     })
 }
 
@@ -16,11 +23,11 @@ pub struct Claims {
     pub sub: String,
     pub exp: usize,
     pub iat: usize,
+    #[serde(default)]
+    pub ver: i64,
 }
 
-pub fn generate_token(
-    user: &user::User,
-) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn generate_token(user: &user::User) -> Result<String, jsonwebtoken::errors::Error> {
     let now = chrono::Utc::now().timestamp() as usize;
     let exp = now + 86400; // Token valid for 24 hour
 
@@ -28,6 +35,7 @@ pub fn generate_token(
         sub: user.user_id.to_string(),
         exp,
         iat: now,
+        ver: user.token_version,
     };
 
     jsonwebtoken::encode(
@@ -38,6 +46,7 @@ pub fn generate_token(
 }
 
 pub async fn jwt_auth_middleware(
+    axum::extract::State(state): axum::extract::State<crate::api::AppState>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, http::StatusCode> {
@@ -48,11 +57,24 @@ pub async fn jwt_auth_middleware(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
 
-
     if let Some(auth_header) = auth_header {
         if let Some(token) = auth_header.strip_prefix("Bearer ") {
             match verify_token(token, secret_key().as_bytes()) {
                 Ok(claims) => {
+                    let id =
+                        uuid::Uuid::parse_str(&claims.sub).map_err(|_| StatusCode::UNAUTHORIZED)?;
+                    let mut conn = state
+                        .db
+                        .get()
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    let actor = crate::user::UserManager::get_user_by_id(&mut conn, id)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        .ok_or(StatusCode::UNAUTHORIZED)?;
+                    if actor.token_version != claims.ver {
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                    drop(conn);
+                    req.extensions_mut().insert(actor);
                     req.extensions_mut().insert(claims);
                     return Ok(next.run(req).await);
                 }
@@ -64,7 +86,6 @@ pub async fn jwt_auth_middleware(
     }
     Err(StatusCode::UNAUTHORIZED)
 }
-
 
 pub fn verify_token(token: &str, secret: &[u8]) -> Result<Claims, jsonwebtoken::errors::Error> {
     let token_data = jsonwebtoken::decode::<Claims>(

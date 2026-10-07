@@ -2,8 +2,8 @@ mod api;
 mod db;
 mod db_types;
 mod file_system;
-mod schema;
 mod jwt;
+mod schema;
 mod share;
 mod user;
 use file_system::file_manager::ensure_root;
@@ -20,8 +20,28 @@ async fn main() {
     {
         let mut conn = pool.get().expect("Failed to get database connection");
         ensure_root(&mut conn).expect("Error initializing root file");
+        if let Ok(password) = std::env::var("ADMIN_PASSWORD") {
+            if !password.is_empty() {
+                user::ensure_admin(&mut conn, &password).expect("Error initializing admin account");
+            }
+        }
     }
 
+    if std::env::args().any(|arg| arg == "--init-admin") {
+        use diesel::prelude::*;
+        let mut conn = pool.get().expect("Failed to get database connection");
+        let count = schema::users::table
+            .filter(schema::users::is_admin.eq(true))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .expect("Failed to check admin account");
+        assert!(
+            count > 0,
+            "Set ADMIN_PASSWORD to initialize an admin account"
+        );
+        println!("Admin initialization completed");
+        return;
+    }
     let state = api::AppState { db: pool };
     let app = api::router(state);
 

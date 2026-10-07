@@ -4,8 +4,8 @@ use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::db::DbConn;
 use crate::db_types::UuidSql;
+use diesel::SqliteConnection;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Queryable, Selectable, Insertable)]
 #[diesel(table_name = crate::schema::users)]
@@ -20,6 +20,9 @@ pub struct User {
     pub created_at: u32,
     #[diesel(serialize_as = i64, deserialize_as = i64)]
     pub updated_at: u32,
+    pub is_admin: bool,
+    #[serde(skip_serializing)]
+    pub token_version: i64,
 }
 
 impl User {
@@ -32,6 +35,8 @@ impl User {
             password_hash: hash_password(password)?,
             created_at: now,
             updated_at: now,
+            is_admin: false,
+            token_version: 0,
         })
     }
 
@@ -44,7 +49,7 @@ pub struct UserManager;
 
 impl UserManager {
     pub fn create_user(
-        conn: &mut DbConn,
+        conn: &mut SqliteConnection,
         name: String,
         password: &str,
     ) -> Result<User, diesel::result::Error> {
@@ -61,7 +66,7 @@ impl UserManager {
     }
 
     pub fn get_user_by_username(
-        conn: &mut DbConn,
+        conn: &mut SqliteConnection,
         user_name: &str,
     ) -> Result<Option<User>, diesel::result::Error> {
         use crate::schema::users::dsl::*;
@@ -75,7 +80,7 @@ impl UserManager {
     }
 
     pub fn get_user_by_id(
-        conn: &mut DbConn,
+        conn: &mut SqliteConnection,
         user_id_val: Uuid,
     ) -> Result<Option<User>, diesel::result::Error> {
         use crate::schema::users::dsl::*;
@@ -100,4 +105,42 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), password_hash)
         .is_ok()
+}
+
+/// Bootstrap once; never overwrite an existing account or reset its password on restart.
+pub fn ensure_admin(conn: &mut SqliteConnection, password: &str) -> Result<Option<User>, String> {
+    use crate::schema::users::dsl::*;
+    if password.len() < 8 {
+        return Err("ADMIN_PASSWORD must be at least 8 bytes".into());
+    }
+    conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+        if users
+            .filter(is_admin.eq(true))
+            .count()
+            .get_result::<i64>(conn)?
+            > 0
+        {
+            return Ok(None);
+        }
+        if users
+            .filter(username.eq("admin"))
+            .first::<User>(conn)
+            .optional()?
+            .is_some()
+        {
+            return Err(diesel::result::Error::RollbackTransaction);
+        }
+        let mut admin = User::new("admin".into(), password)
+            .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+        admin.is_admin = true;
+        diesel::insert_into(users)
+            .values(admin.clone())
+            .execute(conn)?;
+        Ok(Some(admin))
+    })
+    .map_err(|error| {
+        format!(
+            "Unable to initialize admin (an existing admin username will not be promoted): {error}"
+        )
+    })
 }

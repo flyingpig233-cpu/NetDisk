@@ -111,11 +111,13 @@ impl FileManager {
     }
 
     pub fn new_file(&mut self, meta: FileMeta) -> Result<(), FileError> {
-        diesel::insert_into(file_meta::table)
-            .values(meta)
-            .execute(&mut self.db)?;
-
-        Ok(())
+        self.db.immediate_transaction(|conn| {
+            // An upload authorized before account deletion must not recreate orphan metadata.
+            crate::user::UserManager::get_user_by_id(conn, meta.file_owner)?
+                .ok_or(FileError::NotFound)?;
+            diesel::insert_into(file_meta::table).values(meta).execute(conn)?;
+            Ok(())
+        })
     }
 
     pub fn delete_file(&mut self, file_uid: Uuid) -> Result<(), FileError> {
@@ -139,11 +141,13 @@ impl FileManager {
         }
 
         let file_path = get_store_dir().join(&target_file.file_hash);
-        if !file_path.exists() {
+        if !target_file.is_directory && !file_path.exists() {
             return Err(FileError::NotFound);
         }
         diesel::delete(file_meta.filter(file_id.eq(UuidSql::from(file_uid))))
             .execute(&mut self.db)?;
+
+        if target_file.is_directory { return Ok(()); }
 
         if file_meta
             .filter(file_hash.eq(&target_file.file_hash))

@@ -1,5 +1,6 @@
-use std::{fs::File, str::FromStr};
+use std::fs::File;
 
+use crate::db_types::UuidSql;
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -8,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use diesel::prelude::*;
 use outdir_tempdir::TempDir;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
@@ -35,10 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/login", post(login_user));
     let protected_routes = Router::new()
         .route("/", get(root))
-        .route(
-            "/files",
-            get(list_files).post(create_file).delete(delete_file),
-        )
+        .route("/files", get(list_files).post(create_file))
         .route(
             "/files/{file_id}",
             get(get_file).delete(delete_file).patch(rename_file),
@@ -52,8 +51,16 @@ pub fn router(state: AppState) -> Router {
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/move", post(move_file))
         .route("/user_info", get(get_user_info))
+        .route("/admin/users", get(list_users))
+        .route(
+            "/admin/users/{user_id}",
+            get(admin_get_user).patch(update_user).delete(delete_user),
+        )
         .route("/download/{file_id}", get(download))
-        .layer(middleware::from_fn(jwt_auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt_auth_middleware,
+        ));
 
     Router::new()
         .merge(public_routes)
@@ -65,6 +72,7 @@ async fn root() -> &'static str {
     "Hello, World!"
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -81,7 +89,9 @@ impl ApiError {
 
 impl From<diesel::result::Error> for ApiError {
     fn from(value: diesel::result::Error) -> Self {
-        let status = if matches!(
+        let status = if matches!(&value, diesel::result::Error::NotFound) {
+            StatusCode::NOT_FOUND
+        } else if matches!(
             &value,
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::UniqueViolation,
@@ -221,10 +231,12 @@ struct ShareResponse {
 #[derive(Deserialize)]
 struct UploadQuery {
     parent_id: Option<String>,
+    user_id: Option<Uuid>,
 }
 
 async fn list_files(
     State(state): State<AppState>,
+    Extension(actor): Extension<User>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<FileMeta>>, ApiError> {
     let parent_id = match query.parent_id.as_deref() {
@@ -234,7 +246,9 @@ async fn list_files(
             message: "Invalid parent ID".to_string(),
         })?,
     };
+    authorize_owner(&actor, query.user_id)?;
     let mut fm = state.manager()?;
+    validate_parent(&mut fm, parent_id, query.user_id)?;
     Ok(Json(fm.get_file_list(query.user_id, parent_id)?))
 }
 
@@ -246,7 +260,14 @@ async fn register_user(
         .db
         .get()
         .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
-    let user = UserManager::create_user(&mut conn, req.username, &req.password)?;
+    let name = validate_username(&req.username)?;
+    if name.eq_ignore_ascii_case("admin") {
+        return Err(bad_request("admin is a reserved username"));
+    }
+    if req.password.is_empty() {
+        return Err(bad_request("Password cannot be empty"));
+    }
+    let user = UserManager::create_user(&mut conn, name, &req.password)?;
     Ok((StatusCode::CREATED, Json(user)))
 }
 
@@ -264,13 +285,13 @@ async fn get_share(
 
 async fn move_file(
     State(state): State<AppState>,
-    Extension(claims): Extension<crate::jwt::Claims>,
+    Extension(actor): Extension<User>,
     Json(req): Json<MoveFileRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let owner = Uuid::from_str(&claims.sub).map_err(|_| ApiError::internal("Invalid user ID"))?;
+    let owner = actor.user_id;
     let mut fm = state.manager()?;
     let file_meta = fm.get_file_meta(req.file_id)?.ok_or(FileError::NotFound)?;
-    if file_meta.file_owner != owner {
+    if file_meta.file_owner != owner && !actor.is_admin {
         return Err(ApiError {
             status: StatusCode::FORBIDDEN,
             message: "Cannot move another user's file".to_string(),
@@ -287,7 +308,7 @@ async fn move_file(
         let parent = fm
             .get_file_meta(new_parent_id)?
             .ok_or(FileError::NotFound)?;
-        if parent.file_owner != owner {
+        if parent.file_owner != file_meta.file_owner {
             return Err(ApiError {
                 status: StatusCode::FORBIDDEN,
                 message: "Cannot move to another user's folder".to_string(),
@@ -299,6 +320,9 @@ async fn move_file(
                 message: "New parent must be a directory".to_string(),
             });
         }
+    }
+    if req.file_id == ROOT_ID {
+        return Err(bad_request("Cannot move the root directory"));
     }
     fm.move_file(req.file_id, Some(new_parent_id))?;
     Ok(StatusCode::OK)
@@ -313,10 +337,10 @@ async fn login_user(
         .get()
         .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
     let user = UserManager::get_user_by_username(&mut conn, &req.username)?
-        .ok_or_else(|| ApiError::internal("User not found"))?;
+        .ok_or_else(|| unauthorized())?;
 
     if !user.verify_password(&req.password) {
-        return Err(ApiError::internal("Invalid password"));
+        return Err(unauthorized());
     }
 
     let token = crate::jwt::generate_token(&user)
@@ -327,11 +351,13 @@ async fn login_user(
 
 async fn upload(
     State(state): State<AppState>,
-    Extension(claims): Extension<crate::jwt::Claims>,
+    Extension(actor): Extension<User>,
     Query(query): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
-    let owner = Uuid::from_str(&claims.sub).map_err(|_| ApiError::internal("Invalid user ID"))?;
+    let owner = query.user_id.unwrap_or(actor.user_id);
+    authorize_owner(&actor, owner)?;
+    ensure_user_exists(&state, owner)?;
     let parent_id = match query.parent_id.as_deref() {
         None | Some("") => ROOT_ID,
         Some(value) => Uuid::parse_str(value).map_err(|_| ApiError {
@@ -362,6 +388,7 @@ async fn upload(
         .map_err(|e| ApiError::internal(format!("multipart error: {e}")))?
         .ok_or_else(|| ApiError::internal("missing file field"))?;
     let file_name = field.file_name().unwrap_or("unnamed").to_string();
+    validate_file_name(&file_name)?;
 
     let store = get_store_dir();
     let tmp_path = store.join(format!(".upload-{}", Uuid::new_v4()));
@@ -419,24 +446,19 @@ async fn download_share(
         .into_iter()
         .find(|file| file.file_id == file_id)
         .ok_or(ShareError::NotFound)?;
+    drop(conn);
     raw_download(State(state), target_file).await
 }
 
 async fn download(
     State(state): State<AppState>,
-    Extension(claims): Extension<crate::jwt::Claims>,
+    Extension(actor): Extension<User>,
     Path(file_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let mut fm = state.manager()?;
     let meta = fm.get_file_meta(file_id)?.ok_or(FileError::NotFound)?;
-    if meta.file_owner
-        != Uuid::from_str(&claims.sub).map_err(|_| ApiError::internal("Invalid user ID"))?
-    {
-        return Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            message: "Cannot download another user's file".to_string(),
-        });
-    }
+    authorize_owner(&actor, meta.file_owner)?;
+    drop(fm);
     raw_download(State(state), meta).await
 }
 
@@ -491,15 +513,21 @@ async fn raw_download(State(state): State<AppState>, meta: FileMeta) -> Result<R
 
 async fn create_share(
     State(state): State<AppState>,
-    Extension(claims): Extension<crate::jwt::Claims>,
+    Extension(actor): Extension<User>,
     Json(req): Json<CreateShareRequest>,
 ) -> Result<(StatusCode, Json<ShareResponse>), ApiError> {
-    let owner = Uuid::from_str(&claims.sub).map_err(|_| ApiError::internal("Invalid user ID"))?;
+    let owner = actor.user_id;
     let mut conn = state
         .db
         .get()
         .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
-    let share = ShareManager::create_share(&mut conn, owner, req.file_id_list, req.expired_at)?;
+    let share = ShareManager::create_share_as(
+        &mut conn,
+        owner,
+        req.file_id_list,
+        req.expired_at,
+        actor.is_admin,
+    )?;
     Ok((
         StatusCode::CREATED,
         Json(ShareResponse {
@@ -510,32 +538,34 @@ async fn create_share(
 
 async fn get_file(
     State(state): State<AppState>,
+    Extension(actor): Extension<User>,
     Path(file_id): Path<Uuid>,
 ) -> Result<Json<FileMeta>, ApiError> {
     let mut fm = state.manager()?;
-    Ok(Json(fm.get_file_meta(file_id)?.ok_or(FileError::NotFound)?))
+    let meta = fm.get_file_meta(file_id)?.ok_or(FileError::NotFound)?;
+    authorize_owner(&actor, meta.file_owner)?;
+    Ok(Json(meta))
 }
 
-async fn get_user_info(
-    State(state): State<AppState>,
-    Extension(claims): Extension<crate::jwt::Claims>,
-) -> Result<Json<User>, ApiError> {
-    let mut conn = state
-        .db
-        .get()
-        .map_err(|e| ApiError::internal(format!("database pool error: {e}")))?;
-    let user = UserManager::get_user_by_id(
-        &mut conn,
-        Uuid::from_str(&claims.sub).map_err(|_| ApiError::internal("Invalid user ID"))?,
-    )?
-    .ok_or_else(|| ApiError::internal("User not found"))?;
-    Ok(Json(user))
+async fn get_user_info(Extension(actor): Extension<User>) -> Json<User> {
+    Json(actor)
 }
 
 async fn create_file(
     State(state): State<AppState>,
+    Extension(actor): Extension<User>,
     Json(req): Json<CreateFileRequest>,
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
+    authorize_owner(&actor, req.file_owner)?;
+    ensure_user_exists(&state, req.file_owner)?;
+    validate_file_name(&req.file_name)?;
+    if !req.is_directory || !req.file_hash.is_empty() || req.file_size != 0 {
+        return Err(bad_request(
+            "Use /upload for file contents; /files only creates directories",
+        ));
+    }
+    let mut fm = state.manager()?;
+    validate_parent(&mut fm, req.parent_id.unwrap_or(ROOT_ID), req.file_owner)?;
     let now = chrono::Utc::now().timestamp() as u32;
     let meta = FileMeta {
         file_id: Uuid::new_v4(),
@@ -549,16 +579,21 @@ async fn create_file(
         is_directory: req.is_directory,
     };
 
-    let mut fm = state.manager()?;
-    let _ = fm.new_file(meta.clone())?;
+    fm.new_file(meta.clone())?;
 
     Ok((StatusCode::CREATED, Json(meta)))
 }
 async fn delete_file(
     State(state): State<AppState>,
+    Extension(actor): Extension<User>,
     Path(file_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let mut fm = state.manager()?;
+    let meta = fm.get_file_meta(file_id)?.ok_or(FileError::NotFound)?;
+    authorize_owner(&actor, meta.file_owner)?;
+    if file_id == ROOT_ID {
+        return Err(bad_request("Cannot delete the root directory"));
+    }
     fm.delete_file(file_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -566,9 +601,279 @@ async fn delete_file(
 async fn rename_file(
     State(state): State<AppState>,
     Path(file_id): Path<Uuid>,
+    Extension(actor): Extension<User>,
     Json(req): Json<RenameRequest>,
 ) -> Result<StatusCode, ApiError> {
     let mut fm = state.manager()?;
+    let meta = fm.get_file_meta(file_id)?.ok_or(FileError::NotFound)?;
+    authorize_owner(&actor, meta.file_owner)?;
+    if file_id == ROOT_ID {
+        return Err(bad_request("Cannot rename the root directory"));
+    }
+    validate_file_name(&req.file_name)?;
     fm.rename_file(file_id, req.file_name)?;
     Ok(StatusCode::OK)
 }
+
+fn bad_request(message: &str) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: message.into(),
+    }
+}
+fn unauthorized() -> ApiError {
+    ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        message: "Invalid username or password".into(),
+    }
+}
+fn authorize_owner(actor: &User, owner: Uuid) -> Result<(), ApiError> {
+    if actor.is_admin || actor.user_id == owner {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "Access denied".into(),
+        })
+    }
+}
+fn require_admin(actor: &User) -> Result<(), ApiError> {
+    if actor.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "Administrator access required".into(),
+        })
+    }
+}
+fn ensure_user_exists(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    UserManager::get_user_by_id(&mut conn, id)?.ok_or(diesel::result::Error::NotFound)?;
+    Ok(())
+}
+fn validate_parent(fm: &mut FileManager, parent_id: Uuid, owner: Uuid) -> Result<(), ApiError> {
+    if parent_id == ROOT_ID {
+        return Ok(());
+    }
+    let parent = fm.get_file_meta(parent_id)?.ok_or(FileError::NotFound)?;
+    if !parent.is_directory || parent.file_owner != owner {
+        return Err(bad_request(
+            "Parent must be a directory owned by the file owner",
+        ));
+    }
+    Ok(())
+}
+fn validate_username(name: &str) -> Result<String, ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err(bad_request("Username must contain 1 to 64 characters"));
+    }
+    Ok(name.into())
+}
+fn validate_file_name(name: &str) -> Result<(), ApiError> {
+    if name.trim().is_empty()
+        || name == "."
+        || name == ".."
+        || name.chars().count() > 255
+        || name
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(bad_request("Invalid file name"));
+    }
+    Ok(())
+}
+async fn list_users(
+    State(state): State<AppState>,
+    Extension(actor): Extension<User>,
+) -> Result<Json<Vec<User>>, ApiError> {
+    require_admin(&actor)?;
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        crate::schema::users::table
+            .order(crate::schema::users::username.asc())
+            .load(&mut conn)?,
+    ))
+}
+async fn admin_get_user(
+    State(state): State<AppState>,
+    Extension(actor): Extension<User>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<User>, ApiError> {
+    require_admin(&actor)?;
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        UserManager::get_user_by_id(&mut conn, id)?.ok_or(diesel::result::Error::NotFound)?,
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateUserRequest {
+    username: Option<String>,
+    password: Option<String>,
+    is_admin: Option<bool>,
+}
+async fn update_user(
+    State(state): State<AppState>,
+    Extension(actor): Extension<User>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<Json<User>, ApiError> {
+    require_admin(&actor)?;
+    use crate::schema::users::dsl::*;
+    let name = req.username.as_deref().map(validate_username).transpose()?;
+    if req.password.as_ref().is_some_and(|p| p.len() < 8) {
+        return Err(bad_request("New password must be at least 8 bytes"));
+    }
+    let hash = req
+        .password
+        .as_deref()
+        .map(crate::user::hash_password)
+        .transpose()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let changed = conn.immediate_transaction::<_, ApiError, _>(|conn| {
+        let mut target =
+            UserManager::get_user_by_id(conn, id)?.ok_or(diesel::result::Error::NotFound)?;
+        if target.is_admin
+            && req.is_admin == Some(false)
+            && users
+                .filter(is_admin.eq(true))
+                .count()
+                .get_result::<i64>(conn)?
+                <= 1
+        {
+            return Err(bad_request("Cannot demote the last administrator"));
+        }
+        if let Some(value) = &name {
+            target.username = value.clone();
+        }
+        if let Some(value) = &hash {
+            target.password_hash = value.clone();
+            target.token_version += 1;
+        }
+        if let Some(value) = req.is_admin {
+            target.is_admin = value;
+        }
+        target.updated_at = chrono::Utc::now().timestamp() as u32;
+        diesel::update(users.find(UuidSql::from(id)))
+            .set((
+                username.eq(&target.username),
+                password_hash.eq(&target.password_hash),
+                is_admin.eq(target.is_admin),
+                token_version.eq(target.token_version),
+                updated_at.eq(i64::from(target.updated_at)),
+            ))
+            .execute(conn)?;
+        Ok(target)
+    })?;
+    Ok(Json(changed))
+}
+
+/// Delete metadata atomically; blob cleanup is best effort after the account is gone.
+fn delete_user_records(
+    conn: &mut SqliteConnection,
+    actor: &User,
+    id: Uuid,
+) -> Result<Vec<String>, ApiError> {
+    require_admin(actor)?;
+    if actor.user_id == id {
+        return Err(bad_request("Cannot delete the currently logged-in account"));
+    }
+    use crate::schema::{file_meta, share_files, share_table, users};
+    conn.immediate_transaction(|conn| {
+        let target =
+            UserManager::get_user_by_id(conn, id)?.ok_or(diesel::result::Error::NotFound)?;
+        if target.is_admin
+            && users::table
+                .filter(users::is_admin.eq(true))
+                .count()
+                .get_result::<i64>(conn)?
+                <= 1
+        {
+            return Err(bad_request("Cannot delete the last administrator"));
+        }
+        let memberships = share_files::table
+            .inner_join(file_meta::table)
+            .filter(file_meta::file_owner.eq(UuidSql::from(id)))
+            .select(share_files::dic_id)
+            .distinct()
+            .load::<String>(conn)?;
+        let hashes = file_meta::table
+            .filter(file_meta::file_owner.eq(UuidSql::from(id)))
+            .filter(file_meta::is_directory.eq(false))
+            .select(file_meta::file_hash)
+            .distinct()
+            .load::<String>(conn)?;
+        diesel::delete(file_meta::table.filter(file_meta::file_owner.eq(UuidSql::from(id))))
+            .execute(conn)?;
+        // Memberships cascade with file deletion. Remove only affected shares that are now empty.
+        diesel::delete(
+            share_table::table
+                .filter(share_table::dic_id.eq_any(memberships))
+                .filter(diesel::dsl::not(
+                    share_table::dic_id.eq_any(share_files::table.select(share_files::dic_id)),
+                )),
+        )
+        .execute(conn)?;
+        diesel::delete(users::table.find(UuidSql::from(id))).execute(conn)?;
+        Ok(hashes)
+    })
+}
+fn cleanup_user_blobs(conn: &mut SqliteConnection, hashes: &[String], store: &std::path::Path) {
+    use crate::schema::file_meta;
+    for hash in hashes {
+        // Only content-addressed names may become filesystem paths.
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let result = conn.immediate_transaction::<_, FileError, _>(|conn| {
+            let count = file_meta::table
+                .filter(file_meta::file_hash.eq(hash))
+                .count()
+                .get_result::<i64>(conn)?;
+            if count == 0 {
+                match std::fs::remove_file(store.join(hash)) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "Account deleted; unreferenced content cleanup failed");
+        }
+    }
+}
+async fn delete_user(
+    State(state): State<AppState>,
+    Extension(actor): Extension<User>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let hashes = delete_user_records(&mut conn, &actor, id)?;
+    if !hashes.is_empty() {
+        cleanup_user_blobs(&mut conn, &hashes, &get_store_dir());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests;

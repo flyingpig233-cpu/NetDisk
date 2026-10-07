@@ -27,3 +27,7 @@ outdir-tempdir = "0.3.0"
 tracing-appender = "0.2"
 
 tower-http = { version = "0.7.1", features = ["trace"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+serde_json = "1"

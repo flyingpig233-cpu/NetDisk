@@ -37,6 +37,8 @@ diesel::table! {
         password_hash -> Text,
         created_at -> BigInt,
         updated_at -> BigInt,
+        is_admin -> Bool,
+        token_version -> BigInt,
     }
 }
 

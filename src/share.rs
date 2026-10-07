@@ -48,8 +48,18 @@ impl ShareManager {
     pub fn create_share(
         conn: &mut SqliteConnection,
         owner: Uuid,
+        file_ids: Vec<Uuid>,
+        expiration: Option<i64>,
+    ) -> Result<ShareTable, ShareError> {
+        Self::create_share_as(conn, owner, file_ids, expiration, false)
+    }
+
+    pub fn create_share_as(
+        conn: &mut SqliteConnection,
+        owner: Uuid,
         mut file_ids: Vec<Uuid>,
         expiration: Option<i64>,
+        is_admin: bool,
     ) -> Result<ShareTable, ShareError> {
         if file_ids.is_empty() {
             return Err(ShareError::EmptyFiles);
@@ -73,7 +83,7 @@ impl ShareManager {
                     .first::<FileMeta>(conn)
                     .optional()?
                     .ok_or(ShareError::NotFound)?;
-                if file.file_owner != owner || *id == Uuid::nil() {
+                if (!is_admin && file.file_owner != owner) || *id == Uuid::nil() {
                     return Err(ShareError::Forbidden);
                 }
             }
