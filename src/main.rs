@@ -42,6 +42,7 @@ async fn main() {
         println!("Admin initialization completed");
         return;
     }
+
     let state = api::AppState { db: pool };
     let app = api::router(state);
 

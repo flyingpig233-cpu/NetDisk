@@ -115,7 +115,9 @@ impl FileManager {
             // An upload authorized before account deletion must not recreate orphan metadata.
             crate::user::UserManager::get_user_by_id(conn, meta.file_owner)?
                 .ok_or(FileError::NotFound)?;
-            diesel::insert_into(file_meta::table).values(meta).execute(conn)?;
+            diesel::insert_into(file_meta::table)
+                .values(meta)
+                .execute(conn)?;
             Ok(())
         })
     }
@@ -147,7 +149,9 @@ impl FileManager {
         diesel::delete(file_meta.filter(file_id.eq(UuidSql::from(file_uid))))
             .execute(&mut self.db)?;
 
-        if target_file.is_directory { return Ok(()); }
+        if target_file.is_directory {
+            return Ok(());
+        }
 
         if file_meta
             .filter(file_hash.eq(&target_file.file_hash))
