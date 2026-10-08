@@ -48,6 +48,11 @@ pub fn router(state: AppState) -> Router {
             get(download_share),
         )
         .route("/create_share", post(create_share))
+        .route("/share_records", get(list_share_records))
+        .route(
+            "/share_records/{share_id}",
+            axum::routing::delete(revoke_share),
+        )
         .route("/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/move", post(move_file))
         .route("/user_info", get(get_user_info))
@@ -511,6 +516,45 @@ async fn raw_download(State(state): State<AppState>, meta: FileMeta) -> Result<R
         .unwrap())
 }
 
+#[derive(Deserialize)]
+struct ShareListQuery {
+    user_id: Option<Uuid>,
+    #[serde(default)]
+    all: bool,
+}
+async fn list_share_records(
+    State(state): State<AppState>,
+    Extension(actor): Extension<User>,
+    Query(query): Query<ShareListQuery>,
+) -> Result<Json<Vec<crate::share::ShareRecord>>, ApiError> {
+    let owner = if query.all {
+        require_admin(&actor)?;
+        None
+    } else {
+        let id = query.user_id.unwrap_or(actor.user_id);
+        authorize_owner(&actor, id)?;
+        ensure_user_exists(&state, id)?;
+        Some(id)
+    };
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(ShareManager::list_records(&mut conn, owner)?))
+}
+async fn revoke_share(
+    State(state): State<AppState>,
+    Extension(actor): Extension<User>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let mut conn = state
+        .db
+        .get()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    ShareManager::revoke(&mut conn, id, actor.user_id, actor.is_admin)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn create_share(
     State(state): State<AppState>,
     Extension(actor): Extension<User>,
@@ -829,6 +873,8 @@ fn delete_user_records(
                 )),
         )
         .execute(conn)?;
+        diesel::delete(share_table::table.filter(share_table::owner_id.eq(id.to_string())))
+            .execute(conn)?;
         diesel::delete(users::table.find(UuidSql::from(id))).execute(conn)?;
         Ok(hashes)
     })

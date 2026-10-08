@@ -27,6 +27,7 @@ diesel::table! {
         dic_id -> Text,
         created_at -> Timestamp,
         expired_at -> Nullable<Timestamp>,
+        owner_id -> Nullable<Text>,
     }
 }
 

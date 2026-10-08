@@ -21,6 +21,7 @@ fn setup() -> (AppState, User, User, User) {
         include_str!("../../migrations/2026-10-04-000000-0000_remove_link_fields/up.sql"),
         include_str!("../../migrations/2026-10-06-000000-0000_create_shares/up.sql"),
         include_str!("../../migrations/2026-10-07-000000-0000_add_admin_role/up.sql"),
+        include_str!("../../migrations/2026-10-08-000000-0000_add_share_owner/up.sql"),
     ] {
         conn.batch_execute(sql).unwrap();
     }
@@ -583,4 +584,203 @@ async fn account_changes_revoke_password_sessions_and_apply_roles_immediately() 
         "../../migrations/2026-10-07-000000-0000_add_admin_role/up.sql"
     ))
     .unwrap();
+}
+
+#[tokio::test]
+async fn share_lists_are_creator_scoped_and_revocation_keeps_source_files() {
+    let (state, admin, alice, bob) = setup();
+    let admin_token = crate::jwt::generate_token(&admin).unwrap();
+    let alice_token = crate::jwt::generate_token(&alice).unwrap();
+    let bob_token = crate::jwt::generate_token(&bob).unwrap();
+    let folder = directory(&state, &alice_token, alice.user_id, ROOT_ID).await;
+    let (own, delegated) = {
+        let mut conn = state.db.get().unwrap();
+        (
+            ShareManager::create_share(&mut conn, alice.user_id, vec![folder], None).unwrap(),
+            ShareManager::create_share_as(&mut conn, admin.user_id, vec![folder], None, true)
+                .unwrap(),
+        )
+    };
+    let (status, text) = call(
+        &state,
+        Some(&alice_token),
+        "GET",
+        "/share_records",
+        json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let records: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(records.as_array().unwrap().len(), 1);
+    assert_eq!(records[0]["share_id"], own.dic_id.to_string());
+    assert_eq!(records[0]["names"][0], "folder");
+    for path in [
+        format!("/share_records?user_id={}", alice.user_id),
+        "/share_records?all=true".into(),
+    ] {
+        assert_eq!(
+            call(&state, Some(&bob_token), "GET", &path, json!(null))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(&state, Some(&admin_token), "GET", &path, json!(null))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let path = format!("/share_records/{}", own.dic_id);
+    assert_eq!(
+        call(&state, Some(&bob_token), "DELETE", &path, json!(null))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &state,
+            Some(&alice_token),
+            "DELETE",
+            &format!("/share_records/{}", delegated.dic_id),
+            json!(null)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&state, Some(&alice_token), "DELETE", &path, json!(null))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(
+            &state,
+            Some(&bob_token),
+            "GET",
+            &format!("/shares/{}", own.share_code),
+            json!(null)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &state,
+            Some(&bob_token),
+            "GET",
+            &format!("/shares/{}/download/{folder}", own.share_code),
+            json!(null)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &state,
+            Some(&alice_token),
+            "GET",
+            &format!("/files/{folder}"),
+            json!(null)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &state,
+            Some(&admin_token),
+            "DELETE",
+            &format!("/share_records/{}", delegated.dic_id),
+            json!(null)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&state, Some(&alice_token), "DELETE", &path, json!(null))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[test]
+fn share_owner_migration_and_recycled_codes_use_stable_ids() {
+    let (state, admin, alice, bob) = setup();
+    let mut conn = state.db.get().unwrap();
+    // Insert source metadata directly to exercise pre-migration ownership inference.
+    let mut ids = Vec::new();
+    for owner in [alice.user_id, bob.user_id] {
+        let id = Uuid::new_v4();
+        ids.push(id);
+        diesel::insert_into(crate::schema::file_meta::table)
+            .values(FileMeta {
+                file_id: id,
+                file_name: "test".into(),
+                file_size: 0,
+                file_hash: "".into(),
+                file_owner: owner,
+                file_created_at: 0,
+                file_updated_at: 0,
+                parent_id: ROOT_ID,
+                is_directory: true,
+            })
+            .execute(&mut conn)
+            .unwrap();
+    }
+    let single = ShareManager::create_share(&mut conn, alice.user_id, vec![ids[0]], None).unwrap();
+    let mixed = ShareManager::create_share_as(&mut conn, admin.user_id, ids, None, true).unwrap();
+    conn.batch_execute(include_str!(
+        "../../migrations/2026-10-08-000000-0000_add_share_owner/down.sql"
+    ))
+    .unwrap();
+    conn.batch_execute(include_str!(
+        "../../migrations/2026-10-08-000000-0000_add_share_owner/up.sql"
+    ))
+    .unwrap();
+    assert_eq!(
+        ShareManager::get_share(&mut conn, &single.share_code)
+            .unwrap()
+            .unwrap()
+            .owner_id,
+        Some(alice.user_id.to_string())
+    );
+    assert_eq!(
+        ShareManager::get_share(&mut conn, &mixed.share_code)
+            .unwrap()
+            .unwrap()
+            .owner_id,
+        None
+    );
+    assert!(matches!(
+        ShareManager::revoke(&mut conn, mixed.dic_id, alice.user_id, false),
+        Err(ShareError::Forbidden)
+    ));
+    ShareManager::revoke(&mut conn, mixed.dic_id, admin.user_id, true).unwrap();
+    let mut replacement = mixed.clone();
+    replacement.dic_id = Uuid::new_v4();
+    replacement.owner_id = Some(bob.user_id.to_string());
+    diesel::insert_into(crate::schema::share_table::table)
+        .values(replacement.clone())
+        .execute(&mut conn)
+        .unwrap();
+    assert!(matches!(
+        ShareManager::revoke(&mut conn, mixed.dic_id, admin.user_id, true),
+        Err(ShareError::NotFound)
+    ));
+    assert_eq!(
+        ShareManager::get_share(&mut conn, &mixed.share_code)
+            .unwrap()
+            .unwrap()
+            .dic_id,
+        replacement.dic_id
+    );
 }

@@ -17,6 +17,7 @@ pub struct ShareTable {
     pub dic_id: Uuid,
     pub created_at: NaiveDateTime,
     pub expired_at: Option<NaiveDateTime>,
+    pub owner_id: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -40,6 +41,16 @@ impl From<diesel::result::Error> for ShareError {
     fn from(value: diesel::result::Error) -> Self {
         Self::Database(value)
     }
+}
+
+#[derive(Serialize)]
+pub struct ShareRecord {
+    pub share_id: Uuid,
+    pub code: String,
+    pub names: Vec<String>,
+    pub created: i64,
+    pub expires: Option<i64>,
+    pub owner_id: Option<String>,
 }
 
 pub struct ShareManager;
@@ -95,6 +106,7 @@ impl ShareManager {
                     dic_id: Uuid::new_v4(),
                     created_at: now,
                     expired_at: expiration,
+                    owner_id: Some(owner.to_string()),
                 };
                 let inserted = diesel::insert_into(share_table::table)
                     .values(share.clone())
@@ -142,6 +154,59 @@ impl ShareManager {
             .load(conn)
     }
 
+    pub fn list_records(
+        conn: &mut SqliteConnection,
+        owner: Option<Uuid>,
+    ) -> QueryResult<Vec<ShareRecord>> {
+        let mut query = share_table::table.into_boxed();
+        if let Some(owner) = owner {
+            query = query.filter(share_table::owner_id.eq(owner.to_string()));
+        }
+        let shares = query
+            .order((share_table::created_at.desc(), share_table::dic_id.asc()))
+            .load::<ShareTable>(conn)?;
+        shares
+            .into_iter()
+            .map(|share| {
+                let names = share_files::table
+                    .inner_join(file_meta::table)
+                    .filter(share_files::dic_id.eq(UuidSql::from(share.dic_id)))
+                    .order(file_meta::file_name.asc())
+                    .select(file_meta::file_name)
+                    .load::<String>(conn)?;
+                Ok(ShareRecord {
+                    share_id: share.dic_id,
+                    code: share.share_code,
+                    names,
+                    created: share.created_at.and_utc().timestamp(),
+                    expires: share.expired_at.map(|time| time.and_utc().timestamp()),
+                    owner_id: share.owner_id,
+                })
+            })
+            .collect()
+    }
+
+    pub fn revoke(
+        conn: &mut SqliteConnection,
+        id: Uuid,
+        actor: Uuid,
+        is_admin: bool,
+    ) -> Result<(), ShareError> {
+        conn.immediate_transaction(|conn| {
+            let share = share_table::table
+                .filter(share_table::dic_id.eq(UuidSql::from(id)))
+                .first::<ShareTable>(conn)
+                .optional()?
+                .ok_or(ShareError::NotFound)?;
+            if !is_admin && share.owner_id.as_deref() != Some(actor.to_string().as_str()) {
+                return Err(ShareError::Forbidden);
+            }
+            diesel::delete(share_table::table.filter(share_table::dic_id.eq(UuidSql::from(id))))
+                .execute(conn)?;
+            Ok(())
+        })
+    }
+
     pub fn delete_share(conn: &mut SqliteConnection, code: &str) -> QueryResult<usize> {
         diesel::delete(share_table::table.find(code)).execute(conn)
     }
@@ -166,6 +231,7 @@ mod tests {
             include_str!("../migrations/2026-10-01-135407-0000_create_users/up.sql"),
             include_str!("../migrations/2026-10-04-000000-0000_remove_link_fields/up.sql"),
             include_str!("../migrations/2026-10-06-000000-0000_create_shares/up.sql"),
+            include_str!("../migrations/2026-10-08-000000-0000_add_share_owner/up.sql"),
         ] {
             conn.batch_execute(migration).unwrap();
         }
@@ -370,6 +436,10 @@ mod tests {
         .unwrap();
         conn.batch_execute(include_str!(
             "../migrations/2026-10-06-000000-0000_create_shares/up.sql"
+        ))
+        .unwrap();
+        conn.batch_execute(include_str!(
+            "../migrations/2026-10-08-000000-0000_add_share_owner/up.sql"
         ))
         .unwrap();
         assert_eq!(
