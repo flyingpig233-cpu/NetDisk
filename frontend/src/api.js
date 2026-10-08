@@ -64,6 +64,8 @@ export const api = {
     });
   },
   download: id => request(`/download/${encodeURIComponent(id)}`, {}, 'blob'),
+  shareRecords: (userId = '', all = false) => request(`/share_records?${new URLSearchParams(all ? { all: 'true' } : userId ? { user_id: userId } : {})}`),
+  revokeShare: id => request(`/share_records/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   share: (fileIds, expiredAt = null) => request('/create_share', { method: 'POST', body: JSON.stringify({ file_id_list: fileIds, expired_at: expiredAt }) }),
   sharedFiles: code => request(`/shares/${encodeURIComponent(code)}`),
   sharedDownload: (code, id) => request(`/shares/${encodeURIComponent(code)}/download/${encodeURIComponent(id)}`, {}, 'blob'),

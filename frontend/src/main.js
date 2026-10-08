@@ -9,7 +9,7 @@ const input = document.querySelector('#file-input');
 const escape = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 function readPreference(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
 let favorites = new Set(readPreference('netdisk-favorites', []));
-let state = { users: [], managedUser: null, user: null, files: [], section: 'all', folder: ROOT_ID, query: '', view: readPreference('netdisk-view', 'list'), sort: 'updated', selected: new Set(), transfers: [], busy: false, error: '', menu: null, mobile: false };
+let state = { shareRecords: [], shareAll: false, users: [], managedUser: null, user: null, files: [], section: 'all', folder: ROOT_ID, query: '', view: readPreference('netdisk-view', 'list'), sort: 'updated', selected: new Set(), transfers: [], busy: false, error: '', menu: null, mobile: false };
 let noticeTimer;
 let refreshId = 0;
 let authVersion = 0;
@@ -64,7 +64,7 @@ function emptyState() {
 }
 function adminUsers() {
   const users = state.users.filter(user => `${user.username} ${user.user_id}`.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
-  return `<section class="files-section"><div class="files-heading"><h2>全部用户</h2><span class="count">${users.length} 个账户</span></div>${state.error ? `<div class="error-state" role="alert">${escape(state.error)}${actionButton('refresh', '重试', null, 'text-button')}</div>` : ''}${state.busy ? '<div class="loading-state"><span class="spinner"></span>正在读取用户…</div>' : `<div class="admin-user-list">${users.map(user => `<article class="admin-user-row"><div class="admin-user-info"><strong>${escape(user.username)} <span class="share-status">${user.is_admin ? '管理员' : '普通用户'}</span></strong><small>${escape(user.user_id)}</small><small>创建：${date(user.created_at)} · 更新：${date(user.updated_at)}</small></div><div class="admin-user-actions">${actionButton('admin-files', '管理文件', 'folder', 'secondary-button', `data-id="${escape(user.user_id)}"`)}${actionButton('admin-edit-user', '修改账户', 'edit', 'secondary-button', `data-id="${escape(user.user_id)}"`)}${user.user_id !== state.user.user_id ? actionButton('admin-delete-user', '删除用户', 'trash', 'secondary-button danger', `data-id="${escape(user.user_id)}"`) : ''}</div></article>`).join('') || '<div class="empty-state"><h3>没有匹配的用户</h3></div>'}</div>`}</section>`;
+  return `<section class="files-section"><div class="files-heading"><h2>全部用户</h2><span class="count">${users.length} 个账户</span>${actionButton('admin-all-shares', '全部分享', 'share', 'secondary-button')}</div>${state.error ? `<div class="error-state" role="alert">${escape(state.error)}${actionButton('refresh', '重试', null, 'text-button')}</div>` : ''}${state.busy ? '<div class="loading-state"><span class="spinner"></span>正在读取用户…</div>' : `<div class="admin-user-list">${users.map(user => `<article class="admin-user-row"><div class="admin-user-info"><strong>${escape(user.username)} <span class="share-status">${user.is_admin ? '管理员' : '普通用户'}</span></strong><small>${escape(user.user_id)}</small><small>创建：${date(user.created_at)} · 更新：${date(user.updated_at)}</small></div><div class="admin-user-actions">${actionButton('admin-shares', '管理分享', 'share', 'secondary-button', `data-id="${escape(user.user_id)}"`)}${actionButton('admin-files', '管理文件', 'folder', 'secondary-button', `data-id="${escape(user.user_id)}"`)}${actionButton('admin-edit-user', '修改账户', 'edit', 'secondary-button', `data-id="${escape(user.user_id)}"`)}${user.user_id !== state.user.user_id ? actionButton('admin-delete-user', '删除用户', 'trash', 'secondary-button danger', `data-id="${escape(user.user_id)}"`) : ''}</div></article>`).join('') || '<div class="empty-state"><h3>没有匹配的用户</h3></div>'}</div>`}</section>`;
 }
 function deleteUser(user) {
   if (!state.user?.is_admin || !user || user.user_id === state.user.user_id) return;
@@ -124,7 +124,7 @@ function render() {
   const name = state.user.username;
   document.title = `NetDisk · ${sections[state.section]}`;
   app.innerHTML = `${sidebar()}${state.mobile ? '<div class="sidebar-scrim" data-action="mobile-close"></div>' : ''}<div class="workspace"><header class="topbar"><button class="icon-button mobile-menu" data-action="mobile" aria-label="展开导航">${icon('menu')}</button><div class="breadcrumb"><span>${state.managedUser ? escape(state.managedUser.username) + '的文件' : '个人空间'}</span>${icon('arrow')}<strong>${sections[state.section]}</strong></div><div class="top-actions"><button class="mode-pill" data-action="account"><span class="status-dot"></span>${state.user.is_admin ? '管理员' : '已连接'}</button><button class="avatar" data-action="account" aria-label="账户：${escape(name)}">${escape(name.slice(0, 1).toUpperCase())}</button></div></header>
-    <main>${state.managedUser ? `<div class="admin-workspace-banner"><span>正在管理 <strong>${escape(state.managedUser.username)}</strong> 的文件</span>${actionButton('personal-space', '返回我的文件', 'folder', 'text-button')}</div>` : ''}<div class="page-heading"><div><p class="eyebrow">YOUR PERSONAL SPACE</p><h1>${sections[state.section]}<span class="heading-dot">.</span></h1><p class="page-description">${state.section === 'admin' ? '管理用户账户、权限与文件。' : state.section === 'all' ? '每一份文件，都有它的位置。' : state.section === 'recent' ? '接着上次的灵感，继续出发。' : state.section === 'starred' ? '重要的文件，一眼就能找到。' : state.section === 'trash' ? '留一点时间，重新做个决定。' : state.section === 'shared' ? '让好内容，遇见更多人。' : '将同一类收藏，放在一起。'}</p></div><div class="heading-actions">${state.section === 'admin' ? '' : state.section === 'shared' ? actionButton('extract-share', '提取分享', 'download', 'primary-button') : actionButton('create-folder', '新建文件夹', 'plus', 'secondary-button') + actionButton('upload', '上传文件', 'upload', 'primary-button')}</div></div>
+    <main>${state.managedUser ? `<div class="admin-workspace-banner"><span>正在管理 <strong>${escape(state.managedUser.username)}</strong> 的${state.section === 'shared' ? '分享' : '文件'}</span>${actionButton('personal-space', '返回我的文件', 'folder', 'text-button')}</div>` : ''}<div class="page-heading"><div><p class="eyebrow">YOUR PERSONAL SPACE</p><h1>${sections[state.section]}<span class="heading-dot">.</span></h1><p class="page-description">${state.section === 'admin' ? '管理用户账户、权限与文件。' : state.section === 'all' ? '每一份文件，都有它的位置。' : state.section === 'recent' ? '接着上次的灵感，继续出发。' : state.section === 'starred' ? '重要的文件，一眼就能找到。' : state.section === 'trash' ? '留一点时间，重新做个决定。' : state.section === 'shared' ? '让好内容，遇见更多人。' : '将同一类收藏，放在一起。'}</p></div><div class="heading-actions">${state.section === 'admin' ? '' : state.section === 'shared' ? actionButton('extract-share', '提取分享', 'download', 'primary-button') : actionButton('create-folder', '新建文件夹', 'plus', 'secondary-button') + actionButton('upload', '上传文件', 'upload', 'primary-button')}</div></div>
     <div class="search-row"><label class="search-box">${icon('search')}<input id="search" type="search" placeholder="${state.section === 'admin' ? '搜索用户名或用户 ID' : state.section === 'shared' ? '搜索分享码或文件名' : '搜索你的文件'}" aria-label="搜索" value="${escape(state.query)}"><kbd>/</kbd></label>${actionButton('refresh', '刷新', 'clock', 'refresh-button')}</div>
     ${state.folder !== ROOT_ID && state.section === 'all' ? `<div class="folder-breadcrumb"><button class="text-button" data-action="home">全部文件</button>${folderTrail()}</div>` : ''}
     ${recommendations()}${fileArea()}</main><footer class="workspace-footer"><span>NetDisk</span><small>属于你的，始终在这里。</small><span>简而有序</span></footer></div>${transfers()}`;
@@ -154,14 +154,17 @@ function validName(value) {
   return name;
 }
 async function refresh() {
-  if (state.section === 'shared') { ++refreshId; state.busy = false; state.error = ''; render(); return; }
   if (!state.user) { render(); return; }
   const requestId = ++refreshId;
-  const userId = workspaceOwner(); const folder = state.folder; const section = state.section;
-  const isCurrent = () => requestId === refreshId && workspaceOwner() === userId && state.folder === folder && state.section === section;
+  const userId = workspaceOwner(); const folder = state.folder; const section = state.section; const shareAll = state.shareAll;
+  const isCurrent = () => requestId === refreshId && workspaceOwner() === userId && state.folder === folder && state.section === section && state.shareAll === shareAll;
   state.busy = true; state.error = ''; render();
   try {
-    if (section === 'admin') {
+    if (section === 'shared') {
+      const records = await api.shareRecords(userId, shareAll);
+      if (!isCurrent()) return;
+      state.shareRecords = records;
+    } else if (section === 'admin') {
       const users = await api.adminUsers();
       if (!isCurrent()) return;
       state.users = users;
@@ -191,7 +194,7 @@ function logout() {
   ++refreshId;
   ++authVersion;
   resetShareReceiver();
-  state = { ...state, users: [], managedUser: null, user: null, files: [], folder: ROOT_ID, section: 'all', selected: new Set(), query: '', error: '', transfers: [], busy: false, mobile: false };
+  state = { ...state, shareRecords: [], shareAll: false, users: [], managedUser: null, user: null, files: [], folder: ROOT_ID, section: 'all', selected: new Set(), query: '', error: '', transfers: [], busy: false, mobile: false };
   document.querySelector('.context-menu')?.remove();
   render();
 }
@@ -211,7 +214,7 @@ function authDialog(register) {
     let user;
     try { user = await api.user(); } catch (error) { setToken(''); throw error; }
     ++authVersion;
-    state = { ...state, users: [], managedUser: null, user, files: [], section: 'all', folder: ROOT_ID, query: '', selected: new Set(), transfers: [], error: '', busy: false };
+    state = { ...state, shareRecords: [], shareAll: false, users: [], managedUser: null, user, files: [], section: 'all', folder: ROOT_ID, query: '', selected: new Set(), transfers: [], error: '', busy: false };
     resetShareReceiver();
     await refresh(); toast('已连接个人空间');
   }, register ? '注册账户' : '登录');
@@ -352,11 +355,17 @@ document.addEventListener('click', async event => {
   const action = button.dataset.action; const file = fileById(button.dataset.id);
   if (action !== 'more') document.querySelector('.context-menu')?.remove();
   try {
-    if (action === 'admin-delete-user') { deleteUser(state.users.find(u => u.user_id === button.dataset.id)); }
+    if (action === 'admin-shares' || action === 'admin-all-shares') {
+      if (!state.user?.is_admin) return;
+      const user = state.users.find(u => u.user_id === button.dataset.id);
+      if (action === 'admin-shares' && !user) return;
+      state.managedUser = action === 'admin-shares' ? user : null; state.shareAll = action === 'admin-all-shares'; state.shareRecords = []; state.files = []; state.section = 'shared'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); await refresh();
+    }
+    else if (action === 'admin-delete-user') { deleteUser(state.users.find(u => u.user_id === button.dataset.id)); }
     else if (action === 'admin-edit-user') { editUser(state.users.find(u => u.user_id === button.dataset.id)); }
     else if (action === 'admin-files') { const user = state.users.find(u => u.user_id === button.dataset.id); if (!state.user?.is_admin || !user) return; state.managedUser = user; state.files = []; state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); await refresh(); }
-    else if (action === 'personal-space') { state.managedUser = null; state.files = []; state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); await refresh(); }
-    else if (action === 'nav') { state.section = button.dataset.section; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); state.mobile = false; await refresh(); }
+    else if (action === 'personal-space') { state.managedUser = null; state.shareAll = false; state.shareRecords = []; state.files = []; state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); await refresh(); }
+    else if (action === 'nav') { state.shareAll = false; state.shareRecords = []; state.section = button.dataset.section; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); state.mobile = false; await refresh(); }
     else if (action === 'home') { event.preventDefault(); state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); await refresh(); }
     else if (action === 'upload') { if (state.user) input.click(); else authDialog(false); }
     else if (action === 'account') account();
@@ -407,6 +416,8 @@ window.addEventListener('resize', () => document.querySelector('.context-menu')?
 window.addEventListener('scroll', () => document.querySelector('.context-menu')?.remove(), true);
 initShares({
   user: () => state.user, modal, toast, render,
+  history: () => ({ records: state.shareRecords, all: state.shareAll, busy: state.busy, error: state.error }),
+  refreshShares: async () => { state.shareRecords = []; if (state.section === 'shared') await refresh(); },
   login: () => authDialog(false), account,
   home: () => { state.section = 'all'; state.folder = ROOT_ID; state.query = ''; state.selected.clear(); void refresh(); },
 });

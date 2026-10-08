@@ -12,17 +12,6 @@ const downloading = new Set();
 
 export const isShareRoute = () => location.hash.startsWith('#/share');
 export function resetShareReceiver() { receiver.key = ''; receiver.version++; }
-function records() {
-  try {
-    const value = JSON.parse(localStorage.getItem(`netdisk-shares:${hooks.user()?.user_id}`) || '[]');
-    return Array.isArray(value) ? value.filter(r => /^\d{6}$/.test(r.code) && Array.isArray(r.names)) : [];
-  } catch { return []; }
-}
-function saveRecord(record) {
-  try {
-    localStorage.setItem(`netdisk-shares:${hooks.user().user_id}`, JSON.stringify([record, ...records().filter(r => r.code !== record.code)].slice(0, 100)));
-  } catch { hooks.toast('分享已创建，但浏览器无法保存记录，请复制链接'); }
-}
 async function copy(value) {
   try { await navigator.clipboard.writeText(value); hooks.toast('已复制'); }
   catch {
@@ -47,7 +36,8 @@ export function createShare(files) {
     const response = await api.share(files.map(f => f.file_id), expires);
     if (!/^\d{6}$/.test(response?.share_code)) throw new Error('分享接口返回了无效的分享码');
     const record = { code: response.share_code, names: files.map(f => f.file_name), created: Math.floor(Date.now() / 1000), expires };
-    if (hooks.user()?.user_id === owner) saveRecord(record);
+    if (hooks.user()?.user_id !== owner) return false;
+    await hooks.refreshShares();
     hooks.render(); result(record); return false;
   }, '创建分享');
   const select = document.querySelector('#dialog select');
@@ -58,12 +48,25 @@ export function createShare(files) {
 }
 
 export function shareHistory(query = '') {
-  const all = hooks.user() ? records() : [];
-  const filtered = all.filter(r => `${r.code} ${r.names.join(' ')}`.toLowerCase().includes(query.toLowerCase()));
-  return `<section class="files-section share-history"><div class="files-heading"><div class="heading-left"><h2>分享记录</h2><span class="count">${filtered.length} 条</span></div>${button('extract', '提取分享', 'download')}</div><p class="share-history-note">${hooks.user() ? '这里只显示此账户在当前浏览器创建的分享。到期状态依据创建时的设置，打开分享可检查当前文件。' : '登录后可以创建分享；已有分享码也可以在提取页登录并查看。'}</p>${filtered.length ? `<div class="share-records">${filtered.map(r => {
-    const expired = r.expires && r.expires <= Date.now() / 1000;
-    return `<article class="share-record"><div class="share-record-icon">${icon('share')}</div><div class="share-record-content"><h3>${esc(r.names.join('、'))}</h3><p>分享码 <strong>${r.code}</strong> <span class="share-status ${expired ? 'expired' : ''}">${expired ? '已到期' : r.expires ? '有效期内' : '永久有效'}</span></p><small>${r.expires ? `到期：${esc(formatDate(r.expires))}` : '无到期时间'} · 创建：${esc(formatDate(r.created))}</small></div><div class="share-record-actions">${button('copy-link', '复制链接', 'share', `data-code="${r.code}"`)}${button('visit', '查看', 'arrow', `data-code="${r.code}"`)}</div></article>`;
-  }).join('')}</div>` : `<div class="empty-state"><span>${icon('share')}</span><h3>${query ? '没有匹配的分享记录' : '还没有分享记录'}</h3><p>在「我的文件」中选择文件或文件夹，点击分享。</p>${button('home', '前往我的文件', 'folder')}</div>`}</section>`;
+  const history = hooks.history();
+  const filtered = history.records.filter(r => `${r.code} ${r.names.join(' ')}`.toLowerCase().includes(query.toLowerCase()));
+  return `<section class="files-section share-history"><div class="files-heading"><div class="heading-left"><h2>${history.all ? '全部用户分享' : '分享列表'}</h2><span class="count">${filtered.length} 条</span></div>${button('extract', '提取分享', 'download')}</div><p class="share-history-note">分享列表与服务器同步。撤销后链接立即失效，原文件保留。</p>${history.error ? `<div class="error-state" role="alert">${esc(history.error)}${button('refresh-history', '重试', 'clock')}</div>` : ''}${history.busy ? '<div class="loading-state" role="status"><span class="spinner"></span>正在读取分享…</div>' : filtered.length ? `<div class="share-records">${filtered.map(r => {
+    const expired = r.expires != null && r.expires <= Date.now() / 1000;
+    const unavailable = !r.names.length;
+    return `<article class="share-record"><div class="share-record-icon">${icon('share')}</div><div class="share-record-content"><h3>${esc(r.names.join('、') || '原文件已删除')}</h3><p>分享码 <strong>${esc(r.code)}</strong> <span class="share-status ${expired || unavailable ? 'expired' : ''}">${expired ? '已到期' : unavailable ? '无可用文件' : r.expires ? '有效期内' : '永久有效'}</span></p><small>${r.expires ? `到期：${esc(formatDate(r.expires))}` : '无到期时间'} · 创建：${esc(formatDate(r.created))}${history.all ? ` · 创建者：${esc(r.owner_id || '历史分享（创建者未知）')}` : ''}</small></div><div class="share-record-actions">${button('copy-link', '复制链接', 'share', `data-code="${esc(r.code)}"`)}${button('visit', '查看', 'arrow', `data-code="${esc(r.code)}"`)}${button('revoke', '撤销分享', 'trash', `data-id="${esc(r.share_id)}"`, 'secondary-button danger')}</div></article>`;
+  }).join('')}</div>` : history.error ? '' : `<div class="empty-state"><span>${icon('share')}</span><h3>${query ? '没有匹配的分享' : '还没有分享'}</h3><p>选择文件或文件夹即可创建分享。</p>${button('home', '前往我的文件', 'folder')}</div>`}</section>`;
+}
+function revoke(id) {
+  const record = hooks.history().records.find(r => r.share_id === id);
+  if (!record) return;
+  const userId = hooks.user()?.user_id;
+  hooks.modal('确认撤销分享？', `<p class="dialog-description">分享码 <strong>${esc(record.code)}</strong> 对应的链接将立即失效。原文件会保留，此操作无法撤销。</p>`, async () => {
+    await api.revokeShare(id);
+    if (hooks.user()?.user_id !== userId) return;
+    resetShareReceiver();
+    await hooks.refreshShares();
+    hooks.toast('分享已撤销');
+  }, '撤销分享');
 }
 
 async function load(code, key) {
@@ -109,6 +112,8 @@ export function initShares(options) {
     try {
       if (action === 'copy-link') await copy(link(code));
       else if (action === 'copy-code') await copy(code);
+      else if (action === 'revoke') revoke(el.dataset.id);
+      else if (action === 'refresh-history') await hooks.refreshShares();
       else if (action === 'visit') location.hash = `/share/${code}`;
       else if (action === 'extract') location.hash = '/share';
       else if (action === 'home') { location.hash = ''; hooks.home(); }
