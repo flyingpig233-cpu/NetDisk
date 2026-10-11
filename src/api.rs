@@ -12,10 +12,14 @@ use axum::{
 use diesel::prelude::*;
 use outdir_tempdir::TempDir;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use zip::ZipWriter;
+
+mod upload;
+
+const MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+static UPLOAD_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 use crate::share::{ShareError, ShareManager};
 use crate::user::User;
@@ -53,7 +57,12 @@ pub fn router(state: AppState) -> Router {
             "/share_records/{share_id}",
             axum::routing::delete(revoke_share),
         )
-        .route("/upload", post(upload).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/upload",
+            post(upload).layer(DefaultBodyLimit::max(
+                (MAX_UPLOAD_BYTES + 1024 * 1024) as usize,
+            )),
+        )
         .route("/move", post(move_file))
         .route("/user_info", get(get_user_info))
         .route("/admin/users", get(list_users))
@@ -360,6 +369,10 @@ async fn upload(
     Query(query): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
+    let _permit = UPLOAD_SLOTS.try_acquire().map_err(|_| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Too many concurrent uploads; try again later".into(),
+    })?;
     let owner = query.user_id.unwrap_or(actor.user_id);
     authorize_owner(&actor, owner)?;
     ensure_user_exists(&state, owner)?;
@@ -387,38 +400,32 @@ async fn upload(
         }
     }
 
-    let mut field = multipart
+    let field = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::internal(format!("multipart error: {e}")))?
-        .ok_or_else(|| ApiError::internal("missing file field"))?;
+        .map_err(upload::multipart_error)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Missing file field".into(),
+        })?;
     let file_name = field.file_name().unwrap_or("unnamed").to_string();
     validate_file_name(&file_name)?;
 
     let store = get_store_dir();
-    let tmp_path = store.join(format!(".upload-{}", Uuid::new_v4()));
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
-    let mut hasher = blake3::Hasher::new();
-    let mut size: u64 = 0;
-
-    while let Some(chunk) = field
-        .chunk()
+    let (temporary, hash, size) = upload::receive(field, &store, MAX_UPLOAD_BYTES).await?;
+    // Validate the multipart terminator before publishing the file.
+    if multipart
+        .next_field()
         .await
-        .map_err(|e| ApiError::internal(format!("multipart error: {e}")))?
+        .map_err(upload::multipart_error)?
+        .is_some()
     {
-        hasher.update(&chunk);
-        file.write_all(&chunk).await?;
-        size += chunk.len() as u64;
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Expected a single file field".into(),
+        });
     }
-    drop(file);
-
-    let hash = hasher.finalize().to_hex().to_string();
-    let path = store.join(&hash);
-    if path.exists() {
-        tokio::fs::remove_file(&tmp_path).await?;
-    } else {
-        tokio::fs::rename(&tmp_path, &path).await?;
-    }
+    temporary.publish(&store.join(&hash))?;
 
     let now = chrono::Utc::now().timestamp() as u32;
     let meta = FileMeta {
